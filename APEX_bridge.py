@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""F1 25 bridge v3: UDP receiver + data preparation + learning store + dashboard server.
+
+  python3 f1_bridge_v3.py            (add --selftest to feed it synthetic TEST packets, no game needed)
+
+It (1) listens for the game's UDP telemetry, (2) prepares the data (stints, wear rates,
+lap history, best laps, ERS, temperatures, damage, flags) and (3) serves the dashboard itself,
+so you just open the address it prints. The dashboard connects automatically.
+
+In F1 25: Settings > Telemetry Settings > UDP Telemetry ON, UDP Format 2025,
+IP = the address printed below, Port = 20778, Broadcast OFF. Python 3.8+, nothing to install."""
+import socket, struct, json, threading, time, argparse, glob, os
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+ap = argparse.ArgumentParser()
+ap.add_argument('--udp', type=int, default=20778)
+ap.add_argument('--http', type=int, default=20780)
+ap.add_argument('--selftest', action='store_true', help='send synthetic test packets to this bridge')
+ap.add_argument('--page', default='', help='dashboard .html file (auto-detected next to this script)')
+A = ap.parse_args()
+
+# Version-aware packet header detection. F1 2020-22 use the legacy 24-byte header;
+# F1 23 onward use the 29-byte header. Packet payload layouts still require
+# their own year-specific adapter; never decode an unknown layout as F1 25.
+H = 29
+ACTIVE_FORMAT = None
+FORMAT_STATUS = {'format': None, 'header': None, 'adapter': 'waiting', 'message': 'Waiting for UDP packets'}
+COMP = {16: 'SOFT', 17: 'MEDIUM', 18: 'HARD', 7: 'INTER', 8: 'WET'}
+DIR = os.path.dirname(os.path.abspath(__file__))
+LEARN_FILE = os.path.join(DIR, 'learned.json')
+u = lambda f, b, o: struct.unpack_from('<' + f, b, o)
+lock = threading.Lock()
+S = {'t': -1, 'tl': 0, 'me': 0, 'len': 0, 'yr': 0, 'rf': False, 'finish': False, 'wx': {}, 'cars': [dict() for _ in range(22)],
+     'pk': 0, 'seen': 0.0, 'cnt': {}, 'last': {}, 'rate': 0, 'sim': False, 'bytes': 0}
+D = [dict(lh=[], st=[], bl=0, wl=[], lastlap=-1) for _ in range(22)]   # derived per car
+
+
+def derive(i, c):
+    """Behind-the-scenes preparation: stints, lap history, best lap, wear rate."""
+    d = D[i]
+    lap, comp = c.get('l', 0), c.get('tc', '')
+    if lap and comp:
+        if not d['st'] or (d['st'][-1]['tc'] != comp and c.get('a', 0) <= 1):
+            d['st'].append({'tc': comp, 'l': lap})
+            d['wl'] = []
+    if lap and lap != d['lastlap']:
+        if d['lastlap'] != -1 and c.get('ll', 0) > 0:
+            d['lh'] = (d['lh'] + [c['ll']])[-12:]
+            d['bl'] = min([x for x in d['lh'] if x > 0] + ([d['bl']] if d['bl'] else []))
+        d['lastlap'] = lap
+        if 'w' in c:
+            d['wl'] = (d['wl'] + [(c.get('a', 0), c['w'])])[-8:]
+
+
+def detect_header(b):
+    if len(b) < 24: return None
+    fmt = struct.unpack_from('<H', b, 0)[0]
+    if fmt in (2020, 2021, 2022): return fmt, 24
+    if fmt in (2023, 2024, 2025, 2026): return fmt, 29
+    return None
+
+def parse(b):
+    global H, ACTIVE_FORMAT
+    detected = detect_header(b)
+    if not detected: return
+    fmt, header = detected
+    # This bridge's proven payload decoder is the F1 25 layout. Other formats
+    # are detected and reported, but are deliberately not mis-decoded.
+    if fmt != 2025:
+        with lock:
+            FORMAT_STATUS.update(format=fmt, header=header, adapter='not-installed',
+                message=f'F1 {fmt} UDP detected. Its payload adapter is not yet validated; telemetry values are withheld to prevent incorrect readings.')
+            S['seen'] = time.time()
+        return
+    H = header
+    if len(b) < H: return
+    pid = b[6]
+    with lock:
+        ACTIVE_FORMAT = fmt
+        FORMAT_STATUS.update(format=fmt, header=header, adapter='validated-layout', message='F1 25 packet layout selected')
+        S['me'], S['yr'], S['seen'] = b[27], b[1], time.time()
+        S['pk'] += 1
+        S['bytes'] += len(b)
+        S['cnt'][pid] = S['cnt'].get(pid, 0) + 1
+        S['last'] = {'id': pid, 'len': len(b), 'hex': bytes(b[:48]).hex(' ').upper()}
+        if b[28] == 254: S['sim'] = True
+        C = S['cars']
+        if pid == 0:     # motion: world positions
+            for i in range(22):
+                x, y, z = u('fff', b, H + i * 60)
+                C[i]['x'], C[i]['z'] = x, z
+        elif pid == 1:   # session
+            S['tl'] = b[H + 3]
+            S['len'] = u('H', b, H + 4)[0]
+            S['t'] = u('b', b, H + 7)[0]
+            nz = min(b[H + 18], 21)
+            S['wx'] = dict(w=b[H], tt=u('b', b, H + 1)[0], at=u('b', b, H + 2)[0], sc=b[H + 124],
+                           yl=any(u('b', b, H + 19 + k * 5 + 4)[0] == 3 for k in range(nz)),
+                           rain=b[H + 142] if b[H + 126] > 1 else (b[H + 134] if b[H + 126] > 0 else 0))
+        elif pid == 2:   # lap data
+            for i in range(22):
+                o = H + i * 57
+                ll, cl = u('II', b, o)
+                s1m, s1n = u('HB', b, o + 8)
+                s2m, s2n = u('HB', b, o + 11)
+                gm, gmin = u('HB', b, o + 14)
+                lm, ln = u('HB', b, o + 17)
+                C[i].update(ll=ll, cl=cl, s1=s1m + s1n * 60000, s2=s2m + s2n * 60000,
+                            g=(gm + gmin * 60000) / 1000, gl=(lm + ln * 60000) / 1000, d=u('f', b, o + 20)[0],
+                            p=b[o + 32], l=b[o + 33], ps=b[o + 34], np=b[o + 35], sec=b[o + 36], pen=b[o + 38])
+        elif pid == 3:   # events
+            code = bytes(b[H:H + 4]).decode('ascii', 'ignore')
+            if code == 'RDFL':
+                S['rf'] = True
+            elif code in ('CHQF', 'SSTA', 'LGOT'):
+                S['rf'] = False
+            if code == 'SEND':
+                S['finish'] = True
+            elif code == 'SSTA':
+                # A new session must clear the previous session's finish state.
+                S['finish'] = False
+                S['rf'] = False
+                S['t'] = -1
+                S['tl'] = 0
+                S['len'] = 0
+        elif pid == 4:   # participants
+            for i in range(22):
+                o = H + 1 + i * 57
+                C[i]['n'] = b[o + 5]
+                C[i]['nm'] = b[o + 7:o + 39].split(b'\0')[0].decode('utf8', 'ignore') or f'Car {i}'
+        elif pid == 6:   # car telemetry
+            for i in range(22):
+                o = H + i * 60
+                bt = u('HHHH', b, o + 22)
+                temps=list(b[o + 30:o + 34]); inner=list(b[o + 34:o + 38])
+                # F1 25 wheel order in the packet: RL, RR, FL, FR.
+                tm=dict(rl=temps[0], rr=temps[1], fl=temps[2], fr=temps[3])
+                im=dict(rl=inner[0], rr=inner[1], fl=inner[2], fr=inner[3])
+                C[i].update(spd=u('H', b, o)[0], gear=u('b', b, o + 15)[0], drs=b[o + 18], brakeTemp=max(bt),
+                            tyt=round(sum(temps) / 4), tyreTemps=tm, tyreInnerTemps=im, engineTemp=u('H', b, o + 38)[0])
+        elif pid == 7:   # car status
+            for i in range(22):
+                o = H + i * 55
+                C[i].update(f=u('f', b, o + 13)[0], tc=COMP.get(b[o + 26], ''), a=b[o + 27],
+                            ers=round(u('f', b, o + 37)[0] / 4000000 * 100))
+        elif pid == 10:  # damage
+            for i in range(22):
+                o = H + i * 46
+                w = u('ffff', b, o)
+                # F1 25 tyre wear packet order: RL, RR, FL, FR. Preserve all four values.
+                C[i]['tyreWear'] = dict(rl=w[0], rr=w[1], fl=w[2], fr=w[3])
+                C[i]['w'] = sum(w) / 4
+                C[i]['damage'] = dict(frontWing=max(b[o + 28], b[o + 29]), rearWing=b[o + 30], floor=b[o + 31],
+                                      engine=b[o + 37], gearbox=b[o + 36])
+        for i in range(22):
+            if 'l' in C[i]:
+                derive(i, C[i])
+
+
+def snapshot():
+    with lock:
+        cars = []
+        for i, c in enumerate(S['cars']):
+            if c.get('p', 0) > 0 and 'x' in c:
+                d = D[i]
+                x = dict(c, i=i, lh=d['lh'][-8:], bl=d['bl'], st=d['st'][-6:])
+                x.setdefault('nm', f'Car {i}'); x.setdefault('n', i)
+                for k, v in (('w', 0), ('f', 0), ('tc', ''), ('a', 0), ('gl', 0), ('ps', 0), ('np', 0), ('pen', 0), ('sec', 0)):
+                    x.setdefault(k, v)
+                wl = d['wl']        # measured wear per lap over the current stint
+                if len(wl) >= 2 and wl[-1][0] > wl[0][0]:
+                    x['wr'] = round(max(0.3, (wl[-1][1] - wl[0][1]) / (wl[-1][0] - wl[0][0])), 2)
+                cars.append(x)
+        age = time.time() - S['seen'] if S['seen'] else 999
+        return {'t': S['t'], 'tl': S['tl'], 'me': S['me'], 'finish': S['finish'], 'len': S['len'], 'yr': S['yr'], 'rf': S['rf'], 'format': FORMAT_STATUS['format'], 'adapter': FORMAT_STATUS['adapter'], 'formatMessage': FORMAT_STATUS['message'],
+                'wx': S['wx'], 'ok': age < 3, 'pk': S['pk'], 'cnt': S['cnt'], 'last': S['last'], 'rate': S['rate'],
+                'age': round(age, 1), 'sim': S['sim'], 'bytes': S['bytes'], 'cars': cars}
+
+
+def choose_page():
+    """Ask for the exact APEX HTML path, or use --page if supplied."""
+    raw = A.page
+    while True:
+        if not raw:
+            print("\\nAPEX HTML file location")
+            print("Paste the FULL path to your APEX .html file.")
+            raw = input("APEX file path: ").strip()
+
+        raw = raw.strip().strip('"').strip("'")
+        raw = os.path.abspath(os.path.expanduser(raw))
+        if os.path.isfile(raw) and raw.lower().endswith((".html", ".htm")):
+            return raw
+
+        print(f"FILE NOT FOUND or not an HTML file: {raw}")
+        print("Please check the path and paste it again.")
+        raw = ""
+
+
+APEX_PAGE = None
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        for k, v in (('Access-Control-Allow-Origin', '*'), ('Access-Control-Allow-Methods', 'GET,POST,OPTIONS'), ('Access-Control-Allow-Headers', 'content-type')):
+            self.send_header(k, v)
+        self.end_headers()
+
+    def do_POST(self):
+        if self.path.split('?')[0] == '/learn':
+            n = int(self.headers.get('Content-Length', 0) or 0)
+            try:
+                data = json.loads(self.rfile.read(min(n, 2_000_000)))
+                with open(LEARN_FILE, 'w', encoding='utf8') as f:
+                    json.dump(data, f)
+                body = b'{"saved":true}'
+            except Exception as e:
+                body = json.dumps({'saved': False, 'error': str(e)}).encode()
+            self.send_response(200)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def do_GET(self):
+        p = self.path.split('?')[0]
+        if p == '/learn':
+            try:
+                body = open(LEARN_FILE, 'rb').read()
+            except Exception:
+                body = b'{}'
+            self.send_response(200)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if p == '/stream':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            try:
+                while True:
+                    self.wfile.write(('data: ' + json.dumps(snapshot()) + '\n\n').encode())
+                    self.wfile.flush()
+                    time.sleep(0.1)
+            except Exception:
+                pass
+            return
+        if p in ('/health', '/state'):
+            body = json.dumps({'bridge': 'f1-bridge-v3', **({'state': snapshot()} if p == '/state' else
+                                                           {'ok': snapshot()['ok'], 'pk': S['pk']})}).encode()
+            ctype = 'application/json'
+        else:
+            if not APEX_PAGE or not os.path.isfile(APEX_PAGE):
+                self.send_error(404, 'APEX HTML file is no longer available')
+                return
+            body, ctype = open(APEX_PAGE, 'rb').read(), 'text/html; charset=utf-8'
+        self.send_response(200)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def udp():
+    try:
+        k = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        k.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        k.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        k.bind(('0.0.0.0', A.udp))
+        print(f'UDP listening successfully on port {A.udp}')
+
+        while True:
+            try:
+                packet, address = k.recvfrom(4096)
+                parse(packet)
+            except Exception as e:
+                print('UDP receive error:', e)
+
+    except OSError as e:
+        print(f'UDP STARTUP ERROR: {e}')
+        print('Check whether another program is already using port', A.udp)
+
+
+def lan_ip():
+    """Find the LAN address and always close the temporary discovery socket."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(('8.8.8.8', 80))
+        return sock.getsockname()[0]
+    except OSError:
+        return '127.0.0.1'
+    finally:
+        sock.close()
+
+
+
+def rate_loop():
+    last = 0
+    while True:
+        time.sleep(1)
+        S['rate'], last = S['pk'] - last, S['pk']
+
+
+def selftest():
+    """Synthetic TEST traffic (not the game): 12 cars, tyre wear, pit stops, weather. Marked sim=true."""
+    import random, math
+    time.sleep(1.0)
+    sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    dst = ('127.0.0.1', A.udp)
+    names = ['Max Verstappen', 'Lando Norris', 'Charles Leclerc', 'Oscar Piastri', 'Lewis Hamilton', 'You Driver',
+             'George Russell', 'Carlos Sainz', 'Fernando Alonso', 'Alex Albon', 'Pierre Gasly', 'Yuki Tsunoda']
+    FAST = bool(os.environ.get('APEX_TEST_FAST'))
+    N, LT, T0 = 12, (8.0 if FAST else 30.0), time.time()
+    cars = [dict(gl=0.0 if i == 0 else 0.0, comp=[17, 18, 16][i % 3], age=3 + (i * 4) % 14, np=0, ps_until=0.0, lastll=LT * 1000) for i in range(N)]
+    g = 0.0
+    for i in range(N):
+        g += 0 if i == 0 else 1.0 + random.random() * 4.5
+        cars[i]['gl'] = g
+    rate = {16: 3.4, 17: 2.6, 18: 2.0}
+    frame, el0, lastlap = 0, 13 * LT + 12, [0] * N
+    def hdr(pid):
+        return struct.pack('<HBBBBBQfIIBB', 2025, 25, 1, 0, 1, pid, 777, time.time() - T0, frame, frame, 5, 254)
+    while True:
+        frame += 1
+        el = el0 + (time.time() - T0)
+        base = min(c['gl'] for c in cars)
+        order = sorted(range(N), key=lambda i: cars[i]['gl'])
+        pos = {i: k + 1 for k, i in enumerate(order)}
+        m = bytearray(hdr(0))
+        for i in range(22):
+            if i < N:
+                f = (el - cars[i]['gl']) / LT
+                x, z = 1500 * math.cos(f * 6.2832) * (1 + .2 * math.sin(2 * f * 6.2832)), 900 * math.sin(f * 6.2832)
+            else:
+                x = z = 0
+            m += struct.pack('<6f6h6f', x, 0, z, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        sk.sendto(bytes(m), dst)
+        if frame % 5:
+            time.sleep(0.1); continue
+        lap = bytearray(hdr(2)) + bytearray(22 * 57 + 4)
+        part = bytearray(hdr(4)) + bytearray(1 + 22 * 57)
+        part[29] = N
+        sta = bytearray(hdr(7)) + bytearray(22 * 55)
+        dmg = bytearray(hdr(10)) + bytearray(22 * 46)
+        tel = bytearray(hdr(6)) + bytearray(22 * 60 + 4)
+        for k, i in enumerate(order):
+            c = cars[i]
+            if c['age'] * rate[c['comp']] > (30 if FAST else 66) and c['ps_until'] < time.time():
+                c['ps_until'] = time.time() + 22 / 5; c['np'] += 1; c['comp'] = 17 if c['comp'] != 17 else 18
+                c['age'] = 0; c['owed'] = 21 + random.random() * 2; lastlap[i] = -1
+            take = min(c.get('owed', 0), 0.45)
+            c['gl'] += take; c['owed'] = c.get('owed', 0) - take
+            f = (el - c['gl']) / LT
+            L = int(f) + 1
+            c.setdefault('ex', {}); c['ex'][L] = c['ex'].get(L, 0) + take
+            if L != lastlap[i] and lastlap[i] != -1: c['age'] += 1
+            lastlap[i] = L
+            ll = int(LT * 1000 + random.randint(-150, 150) + c['age'] * 18 + c['ex'].get(L - 1, 0) * 1000)
+            gap = 0 if k == 0 else max(0.0, c['gl'] - cars[order[k - 1]]['gl'])
+            gl = max(0.0, c['gl'] - base)
+            o = 29 + i * 57
+            struct.pack_into('<II', lap, o, ll, 12000)
+            struct.pack_into('<HB', lap, o + 14, int(gap * 1000) % 60000, int(gap * 1000) // 60000)
+            struct.pack_into('<HB', lap, o + 17, int(gl * 1000) % 60000, int(gl * 1000) // 60000)
+            struct.pack_into('<fff', lap, o + 20, 100.0, 0.0, 0.0)
+            lap[o + 32], lap[o + 33] = pos[i], L
+            lap[o + 34] = 1 if c['ps_until'] > time.time() else 0
+            lap[o + 35] = c['np']
+            po = 30 + i * 57
+            part[po + 5] = i + 1
+            part[po + 7:po + 7 + len(names[i])] = names[i].encode()
+            so = 29 + i * 55
+            struct.pack_into('<f', sta, so + 13, 40.0 - (L - 13) * 0.9)
+            sta[so + 26], sta[so + 27] = c['comp'], c['age']
+            struct.pack_into('<f', sta, so + 37, 2.4e6)
+            do = 29 + i * 46
+            w = min(95, c['age'] * rate[c['comp']])
+            struct.pack_into('<ffff', dmg, do, w, w, w * .9, w * .9)
+            to = 29 + i * 60
+            struct.pack_into('<H', tel, to, 250 + random.randint(-30, 30))
+            struct.pack_into('<HHHH', tel, to + 22, 640, 650, 600, 610)
+            tel[to + 30:to + 34] = bytes([92, 93, 90, 91])
+        ses = bytearray(hdr(1)) + bytearray(700)
+        ses[29], ses[30], ses[31], ses[32] = 1, 34 & 255, 21, 52
+        struct.pack_into('<H', ses, 33, 5891)
+        ses[36] = 7
+        ses[29 + 126] = 2
+        ses[29 + 142] = int(40 + 22 * math.sin(el / 70))
+        for pk in (lap, part, sta, dmg, tel, ses):
+            sk.sendto(bytes(pk), dst)
+        time.sleep(0.1)
+
+
+# Select and validate the dashboard before opening the network servers.
+APEX_PAGE = choose_page()
+LEARN_FILE = os.path.join(os.path.dirname(APEX_PAGE), 'apex_learned.json')
+print(f"\\nAPEX HTML selected: {APEX_PAGE}")
+
+threading.Thread(target=udp, daemon=True).start()
+threading.Thread(target=rate_loop, daemon=True).start()
+if A.selftest:
+    threading.Thread(target=selftest, daemon=True).start()
+
+ip = lan_ip()
+print(f"\\n  APEX telemetry bridge is starting.")
+print(f"  Dashboard file: {APEX_PAGE}")
+print(f"  Open dashboard: http://{ip}:{A.http}")
+print(f"  Local address:  http://127.0.0.1:{A.http}")
+print(f"  F1 25 UDP: IP = {ip}   Port = {A.udp}   Format = 2025")
+print("  F1 20–24 and 26 are detected only; year-specific payload decoders are not installed or validated.")
+print(f"  Learning data: {LEARN_FILE}")
+print("  Press Stop in the Python editor to shut down the bridge.\\n")
+
+class ReusableHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+try:
+    server = ReusableHTTPServer(('0.0.0.0', A.http), Handler)
+    print(f"HTTP server listening on port {A.http}")
+    server.serve_forever()
+except OSError as e:
+    print(f"HTTP SERVER STARTUP ERROR: {e}")
+    print(f"Port {A.http} may already be in use. Stop the older bridge or choose another --http port.")
+finally:
+    try:
+        server.server_close()
+    except (NameError, OSError):
+        pass
