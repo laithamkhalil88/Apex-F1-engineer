@@ -9,7 +9,7 @@ so you just open the address it prints. The dashboard connects automatically.
 
 In F1 25: Settings > Telemetry Settings > UDP Telemetry ON, UDP Format 2025,
 IP = the address printed below, Port = 20778, Broadcast OFF. Python 3.8+, nothing to install."""
-import socket, struct, json, threading, time, argparse, glob, os
+import socket, struct, json, threading, time, argparse, glob, os, urllib.request, urllib.error
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 ap = argparse.ArgumentParser()
@@ -32,7 +32,11 @@ u = lambda f, b, o: struct.unpack_from('<' + f, b, o)
 lock = threading.Lock()
 S = {'t': -1, 'tl': 0, 'me': 0, 'len': 0, 'yr': 0, 'rf': False, 'finish': False, 'wx': {}, 'cars': [dict() for _ in range(22)],
      'pk': 0, 'seen': 0.0, 'cnt': {}, 'last': {}, 'rate': 0, 'sim': False, 'bytes': 0}
-D = [dict(lh=[], st=[], bl=0, wl=[], lastlap=-1) for _ in range(22)]   # derived per car
+D = [dict(lh=[], st=[], bl=0, wl=[], lastlap=-1) for _ in range(22)]
+
+# OpenAI credentials are held in process memory only; never write them to disk.
+AI_CONFIG = {'api_key': '', 'model': 'gpt-6'}
+AI_LOCK = threading.Lock()   # derived per car
 
 
 def derive(i, c):
@@ -209,6 +213,65 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        route = self.path.split('?')[0]
+        if route in ('/ai/config', '/ai'):
+            n = int(self.headers.get('Content-Length', 0) or 0)
+            try:
+                data = json.loads(self.rfile.read(min(n, 1_000_000)))
+                if route == '/ai/config':
+                    key = str(data.get('apiKey', '')).strip()
+                    model = str(data.get('model', 'gpt-6')).strip()[:100] or 'gpt-6'
+                    if not key:
+                        raise ValueError('API key is empty')
+                    with AI_LOCK:
+                        AI_CONFIG.update(api_key=key, model=model)
+                    payload = {'saved': True, 'model': model}
+                else:
+                    with AI_LOCK:
+                        key, configured_model = AI_CONFIG['api_key'], AI_CONFIG['model']
+                    if not key:
+                        raise ValueError('No OpenAI key configured. Save it in HQ Voice & AI settings first.')
+                    model = str(data.get('model') or configured_model)[:100]
+                    messages = []
+                    system = str(data.get('system') or 'You are HQ, a helpful assistant.')[:12000]
+                    messages.append({'role': 'system', 'content': system})
+                    for item in data.get('history', [])[-10:]:
+                        role = item.get('role') if isinstance(item, dict) else None
+                        content = item.get('content') if isinstance(item, dict) else None
+                        if role in ('user', 'assistant') and isinstance(content, str):
+                            messages.append({'role': role, 'content': content[:6000]})
+                    user_text = str(data.get('message', '')).strip()
+                    if not user_text:
+                        raise ValueError('Message is empty')
+                    messages.append({'role': 'user', 'content': user_text[:6000]})
+                    body = json.dumps({'model': model, 'input': messages, 'max_output_tokens': 500}).encode('utf-8')
+                    req = urllib.request.Request('https://api.openai.com/v1/responses', data=body,
+                        headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'}, method='POST')
+                    try:
+                        with urllib.request.urlopen(req, timeout=35) as response:
+                            result = json.loads(response.read().decode('utf-8'))
+                    except urllib.error.HTTPError as exc:
+                        detail = exc.read().decode('utf-8', 'replace')[:1200]
+                        raise RuntimeError('OpenAI HTTP ' + str(exc.code) + ': ' + detail)
+                    chunks = []
+                    for item in result.get('output', []):
+                        for part in item.get('content', []):
+                            if part.get('type') == 'output_text': chunks.append(part.get('text', ''))
+                    answer = '\n'.join(x for x in chunks if x).strip()
+                    if not answer: raise RuntimeError('OpenAI returned no text. Check model access and API response.')
+                    payload = {'reply': answer, 'model': result.get('model', model)}
+                body = json.dumps(payload).encode('utf-8')
+                status = 200
+            except Exception as e:
+                body = json.dumps({'error': str(e)}).encode('utf-8')
+                status = 502 if route == '/ai' else 400
+            self.send_response(status)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path.split('?')[0] == '/learn':
             n = int(self.headers.get('Content-Length', 0) or 0)
             try:
@@ -255,7 +318,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if p in ('/health', '/state'):
             body = json.dumps({'bridge': 'f1-bridge-v3', **({'state': snapshot()} if p == '/state' else
-                                                           {'ok': snapshot()['ok'], 'pk': S['pk']})}).encode()
+                                                           {'ok': snapshot()['ok'], 'pk': S['pk'], 'aiConfigured': bool(AI_CONFIG['api_key']), 'aiModel': AI_CONFIG['model']})}).encode()
             ctype = 'application/json'
         else:
             if not APEX_PAGE or not os.path.isfile(APEX_PAGE):
